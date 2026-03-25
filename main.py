@@ -330,45 +330,10 @@ while True:
 cap.release()
 cv2.destroyAllWindows()
 print("System shutdown complete")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+print ("Final attendance session data:")
+for id, info in attendance_session.items():
+    print(f"ID: {id}, Name: {info['name']}, Attendance: {info['total_attendance']}")
+    
 
 
 
