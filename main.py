@@ -4,425 +4,294 @@ import numpy as np
 import cv2
 import face_recognition
 import cvzone
-from datetime import datetime, timedelta
+from datetime import datetime
 from firebase_admin import credentials, db
 import firebase_admin
+import threading
+import queue
 import time
+import csv
 
-# Initialize Firebase only if not already initialized
+# ==========================================
+# 1. Firebase Initialization
+# ==========================================
 if not firebase_admin._apps:
     cred = credentials.Certificate("serviceAccountKey.json")
     firebase_admin.initialize_app(cred, {
         'databaseURL': "https://attendancesystem-335f9-default-rtdb.firebaseio.com/"
     })
 
-# Camera setup with error checking
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Could not open camera. Trying camera index 1...")
-    cap = cv2.VideoCapture(1)
-    if not cap.isOpened():
-        print("Error: No camera found. Please check your camera connection.")
-        exit()
+# ==========================================
+# 2. Thread-safe Queues and Caches
+# ==========================================
+frame_queue = queue.Queue(maxsize=1)        # Latest frame from camera
+result_queue = queue.Queue(maxsize=1)       # Face detection results
+db_task_queue = queue.Queue()               # Tasks for database thread
 
-cap.set(3, 640)  # Width
-cap.set(4, 480)  # Height
+student_cache = {}                          # Cached student info and images
+attendance_cooldown = {}                    # To prevent duplicate marking (e.g., 30s cooldown)
+COOLDOWN_SECONDS = 30
 
-# Check if background image exists
-background_path = 'Resources/background.png'
-if os.path.exists(background_path):
-    imgBackground = cv2.imread(background_path)
-else:
-    # Create a simple background if file doesn't exist
-    imgBackground = np.zeros((720, 1280, 3), dtype=np.uint8)
-    imgBackground[:] = (50, 50, 50)  # Dark gray background
-    print("Background image not found. Using default background.")
+# Lock for shared resources
+cache_lock = threading.Lock()
+app_active = True
 
-# Importing the mode images into a list
-folderModePath = 'Resources/Modes'
-imgModeList = []
-if os.path.exists(folderModePath):
-    modePathList = os.listdir(folderModePath)
-    for path in modePathList:
-        imgModeList.append(cv2.imread(os.path.join(folderModePath, path)))
-else:
-    # Create default mode images if folder doesn't exist
-    print("Mode images folder not found. Creating default mode images.")
-    for i in range(4):
-        mode_img = np.zeros((633, 414, 3), dtype=np.uint8)
-        mode_img[:] = (100, 100, 100)
-        cv2.putText(mode_img, f"Mode {i}", (150, 300), cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 3)
-        imgModeList.append(mode_img)
+# ==========================================
+# 3. Helper Classes & Threads
+# ==========================================
 
-# Load the encoding file
-print("Loading Encode File ...")
-try:
-    with open('EncodeFile.p', 'rb') as file:
-        encodeListKnownWithIds = pickle.load(file)
-    encodeListKnown, studentIds = encodeListKnownWithIds
-    print("Encode File Loaded")
-except FileNotFoundError:
-    print("Error: EncodeFile.p not found. Please run EncodeGenerator.py first.")
-    exit()
+class CameraThread(threading.Thread):
+    """Continuously captures frames from the camera to ensure zero lag."""
+    def __init__(self, camera_index=0):
+        super().__init__(daemon=True)
+        self.cap = cv2.VideoCapture(camera_index)
+        self.cap.set(3, 640)
+        self.cap.set(4, 480)
+        if not self.cap.isOpened():
+            print(f"Error: Camera {camera_index} failed to open.")
 
-# Lecture management variables
-LECTURE_DURATION = 60  # 60 minutes
-RECHECK_INTERVAL = 30  # 30 minutes
-lecture_start_time = None
-lecture_active = False
-last_recheck_time = None
-
-# Attendance tracking variables
-modeType = 0
-counter = 0
-id = -1
-imgStudent = []
-attendance_session = {}
-
-def start_lecture():
-    """Start a new lecture session"""
-    global lecture_start_time, lecture_active, last_recheck_time, attendance_session
-    lecture_start_time = datetime.now()
-    lecture_active = True
-    last_recheck_time = lecture_start_time
-    attendance_session = {}
-    print(f"Lecture started at {lecture_start_time.strftime('%H:%M:%S')}")
-    return True
-
-def is_lecture_time():
-    """Check if we're within lecture hours (9 AM to 6 PM)"""
-    current_hour = datetime.now().hour
-    return 9 <= current_hour <= 18
-
-def should_recheck_attendance():
-    """Check if it's time for attendance recheck"""
-    global last_recheck_time
-    if not lecture_active or last_recheck_time is None:
-        return False
-    
-    time_since_last_check = (datetime.now() - last_recheck_time).total_seconds() / 60
-    return time_since_last_check >= RECHECK_INTERVAL
-
-def end_lecture():
-    """End the current lecture session"""
-    global lecture_active, lecture_start_time
-    if lecture_active:
-        lecture_end_time = datetime.now()
-        duration = (lecture_end_time - lecture_start_time).total_seconds() / 60
-        print(f"Lecture ended. Duration: {duration:.1f} minutes")
-        print(f"Students attended: {list(attendance_session.keys())}")
-        lecture_active = False
-    return True
-
-def mark_attendance(student_id):
-    """Mark attendance for a student"""
-    global last_recheck_time, attendance_session
-    
-    try:
-        # Get student info from database
-        studentInfo = db.reference(f'Students/{student_id}').get()
-        if not studentInfo:
-            print(f"Student {student_id} not found in database")
-            return False
-        
-        current_time = datetime.now()
-        
-        # Check if this is a recheck or first attendance
-        if student_id in attendance_session:
-            # This is a recheck
-            last_attendance = attendance_session[student_id]['last_seen']
-            time_diff = (current_time - last_attendance).total_seconds() / 60
-            
-            if time_diff >= RECHECK_INTERVAL - 5:  # 5 minute tolerance
-                attendance_session[student_id]['rechecks'] += 1
-                attendance_session[student_id]['last_seen'] = current_time
-                print(f"Recheck attendance for {studentInfo['name']} - Recheck #{attendance_session[student_id]['rechecks']}")
-        else:
-            # First time attendance
-            attendance_session[student_id] = {
-                'first_seen': current_time,
-                'last_seen': current_time,
-                'rechecks': 0,
-                'name': studentInfo['name']
-            }
-            
-            # Update database only for first attendance
-            ref = db.reference(f'Students/{student_id}')
-            studentInfo['total_attendance'] += 1
-            ref.child('total_attendance').set(studentInfo['total_attendance'])
-            ref.child('last_attendance_time').set(current_time.strftime("%Y-%m-%d %H:%M:%S"))
-            print(f"First attendance marked for {studentInfo['name']}")
-        
-        # Update last recheck time if this was a scheduled recheck
-        if should_recheck_attendance():
-            last_recheck_time = current_time
-            
-        return True
-        
-    except Exception as e:
-        print(f"Error marking attendance: {e}")
-        return False
-
-# Main loop
-print("Smart Attendance System Started")
-print("Press 's' to start lecture, 'e' to end lecture, 'q' to quit")
-
-while True:
-    success, img = cap.read()
-    
-    if not success or img is None:
-        print("Failed to capture image from camera")
-        time.sleep(0.1)
-        continue
-    
-    # Ensure image is in correct format
-    if len(img.shape) != 3 or img.shape[2] != 3:
-        print("Invalid image format from camera")
-        continue
-    
-    # Resize and convert image for face recognition
-    imgS = cv2.resize(img, (0, 0), None, 0.25, 0.25)
-    imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
-    
-    # Check if image is valid after conversion
-    if imgS is None or imgS.size == 0:
-        continue
-    
-    try:
-        faceCurFrame = face_recognition.face_locations(imgS)
-        encodeCurFrame = face_recognition.face_encodings(imgS, faceCurFrame)
-    except Exception as e:
-        print(f"Face recognition error: {e}")
-        continue
-    
-    # Update background display
-    if imgBackground.shape[0] >= 642 and imgBackground.shape[1] >= 695:
-        imgBackground[162:162 + 480, 55:55 + 640] = img
-    
-    # Display mode image
-    if len(imgModeList) > modeType and imgBackground.shape[0] >= 677 and imgBackground.shape[1] >= 1222:
-        imgBackground[44:44 + 633, 808:808 + 414] = imgModeList[modeType]
-    
-    # Display lecture status
-    status_text = ""
-    if lecture_active:
-        elapsed_time = (datetime.now() - lecture_start_time).total_seconds() / 60
-        status_text = f"Lecture Active - {elapsed_time:.1f} min"
-        if elapsed_time >= LECTURE_DURATION:
-            status_text += " (OVERTIME)"
-    else:
-        if is_lecture_time():
-            status_text = "Ready - Press 's' to start lecture"
-        else:
-            status_text = "Outside lecture hours (9 AM - 6 PM)"
-    
-    cv2.putText(imgBackground, status_text, (50, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-    
-    # Display attendance count
-    if lecture_active:
-        count_text = f"Students Present: {len(attendance_session)}"
-        cv2.putText(imgBackground, count_text, (50, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-    
-    # Process faces only during active lecture
-    if faceCurFrame and lecture_active:
-        for encodeFace, faceLoc in zip(encodeCurFrame, faceCurFrame):
-            matches = face_recognition.compare_faces(encodeListKnown, encodeFace)
-            faceDis = face_recognition.face_distance(encodeListKnown, encodeFace)
-            
-            matchIndex = np.argmin(faceDis)
-            
-            if matches[matchIndex] and faceDis[matchIndex] < 0.50:  # Confidence threshold
-                y1, x2, y2, x1 = faceLoc
-                y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
-                bbox = 55 + x1, 162 + y1, x2 - x1, y2 - y1
-                imgBackground = cvzone.cornerRect(imgBackground, bbox, rt=0)
-                id = studentIds[matchIndex]
-                
-                if counter == 0:
-                    cvzone.putTextRect(imgBackground, "Loading", (275, 400))
-                    cv2.imshow("Face Attendance", imgBackground)
-                    cv2.waitKey(1)
-                    counter = 1
-                    modeType = 1
-        
-        if counter != 0:
-            if counter == 1:
-                # Mark attendance
-                if mark_attendance(id):
-                    # Get the Image from local storage
-                    img_path = f'Images/{id}.png'
-                    if os.path.exists(img_path):
-                        imgStudent = cv2.imread(img_path)
-                    else:
-                        # Create placeholder image if student image not found
-                        imgStudent = np.zeros((216, 216, 3), dtype=np.uint8)
-                        imgStudent[:] = (100, 100, 100)
-                        cv2.putText(imgStudent, "No Image", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                else:
-                    modeType = 3
-                    counter = 0
-                    if len(imgModeList) > modeType:
-                        imgBackground[44:44 + 633, 808:808 + 414] = imgModeList[modeType]
-            
-            if modeType != 3:
-                if 10 < counter < 20:
-                    modeType = 2
-                
-                if len(imgModeList) > modeType:
-                    imgBackground[44:44 + 633, 808:808 + 414] = imgModeList[modeType]
-                
-                if counter <= 10 and id in attendance_session:
-                    # Get student info for display
+    def run(self):
+        global app_active
+        while app_active:
+            success, img = self.cap.read()
+            if success:
+                # Keep only the latest frame
+                if not frame_queue.empty():
                     try:
-                        studentInfo = db.reference(f'Students/{id}').get()
-                        if studentInfo:
-                            cv2.putText(imgBackground, str(studentInfo['total_attendance']), (861, 125),
-                                       cv2.FONT_HERSHEY_COMPLEX, 1, (255, 255, 255), 1)
-                            cv2.putText(imgBackground, str(studentInfo['major']), (1006, 550),
-                                       cv2.FONT_HERSHEY_COMPLEX, 0.5, (255, 255, 255), 1)
-                            cv2.putText(imgBackground, str(id), (1006, 493),
-                                       cv2.FONT_HERSHEY_COMPLEX, 0.5, (255, 255, 255), 1)
-                            cv2.putText(imgBackground, str(studentInfo['CGPA']), (910, 625),
-                                       cv2.FONT_HERSHEY_COMPLEX, 0.6, (100, 100, 100), 1)
-                            cv2.putText(imgBackground, str(studentInfo['year']), (1025, 625),
-                                       cv2.FONT_HERSHEY_COMPLEX, 0.6, (100, 100, 100), 1)
-                            cv2.putText(imgBackground, str(studentInfo['starting_year']), (1125, 625),
-                                       cv2.FONT_HERSHEY_COMPLEX, 0.6, (100, 100, 100), 1)
+                        frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                frame_queue.put(img)
+            else:
+                time.sleep(0.1)
+        self.cap.release()
+
+class FaceProcessingThread(threading.Thread):
+    """Handles heavy face recognition processing."""
+    def __init__(self, encode_file='EncodeFile.p'):
+        super().__init__(daemon=True)
+        print("Loading Encode File ...")
+        try:
+            with open(encode_file, 'rb') as f:
+                self.encodeListKnown, self.studentIds = pickle.load(f)
+            print("Encode File Loaded")
+        except FileNotFoundError:
+            print(f"Error: {encode_file} not found!")
+            self.encodeListKnown, self.studentIds = [], []
+
+    def run(self):
+        global app_active
+        while app_active:
+            if not frame_queue.empty():
+                img = frame_queue.get()
+                
+                # Pre-process frame (resize for speed)
+                imgS = cv2.resize(img, (0, 0), None, 0.25, 0.25)
+                imgS = cv2.cvtColor(imgS, cv2.COLOR_BGR2RGB)
+                
+                faceCurFrame = face_recognition.face_locations(imgS)
+                encodeCurFrame = face_recognition.face_encodings(imgS, faceCurFrame)
+                
+                found_matches = []
+                for encodeFace, faceLoc in zip(encodeCurFrame, faceCurFrame):
+                    matches = face_recognition.compare_faces(self.encodeListKnown, encodeFace)
+                    faceDis = face_recognition.face_distance(self.encodeListKnown, encodeFace)
+                    
+                    if len(faceDis) > 0:
+                        matchIndex = np.argmin(faceDis)
+                        if matches[matchIndex] and faceDis[matchIndex] < 0.50:
+                            student_id = self.studentIds[matchIndex]
+                            found_matches.append({
+                                'id': student_id,
+                                'bbox': faceLoc  # y1, x2, y2, x1
+                            })
+                
+                # Push results back to UI
+                if not result_queue.empty():
+                    try:
+                        result_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                result_queue.put(found_matches)
+            else:
+                time.sleep(0.01)
+
+class DatabaseThread(threading.Thread):
+    """Handles Firebase operations and image loading asynchronously."""
+    def run(self):
+        global app_active
+        while app_active:
+            try:
+                # Wait for a task (student_id)
+                student_id = db_task_queue.get(timeout=1)
+                
+                with cache_lock:
+                    if student_id not in student_cache:
+                        print(f"Fetching data for {student_id}...")
+                        # 1. Get info from Firebase
+                        student_info = db.reference(f'Students/{student_id}').get()
+                        
+                        # 2. Get image from disk
+                        img_path = f'Images/{student_id}.png'
+                        img_student = None
+                        if os.path.exists(img_path):
+                            img_student = cv2.imread(img_path)
+                        
+                        # Cache it
+                        student_cache[student_id] = {
+                            'info': student_info,
+                            'img': img_student,
+                            'last_seen': datetime.now()
+                        }
+                    
+                    # 3. Mark attendance logic (with cooldown)
+                    current_time = datetime.now()
+                    last_marked = attendance_cooldown.get(student_id)
+                    
+                    if last_marked is None or (current_time - last_marked).total_seconds() > COOLDOWN_SECONDS:
+                        ref = db.reference(f'Students/{student_id}')
+                        if student_cache[student_id]['info']:
+                            student_cache[student_id]['info']['total_attendance'] += 1
+                            ref.child('total_attendance').set(student_cache[student_id]['info']['total_attendance'])
+                            ref.child('last_attendance_time').set(current_time.strftime("%Y-%m-%d %H:%M:%S"))
+                            attendance_cooldown[student_id] = current_time
+                            print(f"Attendance marked for: {student_cache[student_id]['info']['name']}")
+                
+                db_task_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"Database error: {e}")
+
+# ==========================================
+# 4. Main Application
+# ==========================================
+
+def main():
+    global app_active
+    
+    # Load UI assets
+    imgBackground = cv2.imread('Resources/background.png')
+    folderModePath = 'Resources/Modes'
+    imgModeList = [cv2.imread(os.path.join(folderModePath, p)) for p in os.listdir(folderModePath)] if os.path.exists(folderModePath) else []
+    
+    # Start threads
+    cam_thread = CameraThread()
+    proc_thread = FaceProcessingThread()
+    db_thread = DatabaseThread()
+    
+    cam_thread.start()
+    proc_thread.start()
+    db_thread.start()
+    
+    modeType = 0
+    counter = 0
+    id = -1
+    
+    print("Multi-threaded Attendance System Started. Press 'q' to quit.")
+    
+    while True:
+        if not frame_queue.empty():
+            img = frame_queue.get()
+            
+            # 1. Check for processing results
+            current_results = []
+            if not result_queue.empty():
+                current_results = result_queue.get()
+            
+            # 2. Update Background
+            imgBackground[162:162 + 480, 55:55 + 640] = img
+            imgBackground[44:44 + 633, 808:808 + 414] = imgModeList[modeType] if modeType < len(imgModeList) else imgModeList[0]
+
+            # 3. Process matches
+            if current_results:
+                for match in current_results:
+                    id = match['id']
+                    y1, x2, y2, x1 = match['bbox']
+                    y1, x2, y2, x1 = y1 * 4, x2 * 4, y2 * 4, x1 * 4
+                    bbox = 55 + x1, 162 + y1, x2 - x1, y2 - y1
+                    imgBackground = cvzone.cornerRect(imgBackground, bbox, rt=0)
+                    
+                    if counter == 0:
+                        cvzone.putTextRect(imgBackground, "Loading", (275, 400))
+                        # Signal database thread to fetch/mark
+                        db_task_queue.put(id)
+                        counter = 1
+                        modeType = 1
+            
+            # 4. Handle UI Animation/States
+            if counter != 0:
+                if counter == 1:
+                    # Check if data is in cache
+                    with cache_lock:
+                        if id in student_cache:
+                            studentInfo = student_cache[id]['info']
+                            imgStudent = student_cache[id]['img']
                             
-                            (w, h), _ = cv2.getTextSize(studentInfo['name'], cv2.FONT_HERSHEY_COMPLEX, 1, 1)
-                            offset = (414 - w) // 2
-                            cv2.putText(imgBackground, str(studentInfo['name']), (808 + offset, 445),
-                                       cv2.FONT_HERSHEY_COMPLEX, 1, (50, 50, 50), 1)
-                            
-                            if imgStudent is not None and imgStudent.size > 0:
-                                try:
+                            if studentInfo:
+                                # Update info on background
+                                cv2.putText(imgBackground, str(studentInfo['total_attendance']), (861, 125),
+                                           cv2.FONT_HERSHEY_COMPLEX, 1, (255, 255, 255), 1)
+                                cv2.putText(imgBackground, str(studentInfo['major']), (1006, 550),
+                                           cv2.FONT_HERSHEY_COMPLEX, 0.5, (255, 255, 255), 1)
+                                cv2.putText(imgBackground, str(id), (1006, 493),
+                                           cv2.FONT_HERSHEY_COMPLEX, 0.5, (255, 255, 255), 1)
+                                cv2.putText(imgBackground, str(studentInfo['CGPA']), (910, 625),
+                                           cv2.FONT_HERSHEY_COMPLEX, 0.6, (100, 100, 100), 1)
+                                cv2.putText(imgBackground, str(studentInfo['year']), (1025, 625),
+                                           cv2.FONT_HERSHEY_COMPLEX, 0.6, (100, 100, 100), 1)
+                                cv2.putText(imgBackground, str(studentInfo['starting_year']), (1125, 625),
+                                           cv2.FONT_HERSHEY_COMPLEX, 0.6, (100, 100, 100), 1)
+                                
+                                (w, h), _ = cv2.getTextSize(studentInfo['name'], cv2.FONT_HERSHEY_COMPLEX, 1, 1)
+                                offset = (414 - w) // 2
+                                cv2.putText(imgBackground, str(studentInfo['name']), (808 + offset, 445),
+                                           cv2.FONT_HERSHEY_COMPLEX, 1, (50, 50, 50), 1)
+                                
+                                if imgStudent is not None:
                                     imgStudent_resized = cv2.resize(imgStudent, (216, 216))
                                     imgBackground[175:175 + 216, 909:909 + 216] = imgStudent_resized
-                                except:
-                                    pass
-                    except Exception as e:
-                        print(f"Error displaying student info: {e}")
+                            
+                            if counter > 2: # Give it a few frames to show "Loading"
+                                modeType = 2
+                        else:
+                            # Still fetching...
+                            modeType = 1
                 
                 counter += 1
-                
-                if counter >= 20:
+                if counter >= 30: # Display for ~30 frames
                     counter = 0
                     modeType = 0
-                    imgStudent = []
-                    if len(imgModeList) > modeType:
-                        imgBackground[44:44 + 633, 808:808 + 414] = imgModeList[modeType]
-    else:
-        modeType = 0
-        counter = 0
+            
+            cv2.imshow("Face Attendance", imgBackground)
+            
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            app_active = False
+            break
+
+    cv2.destroyAllWindows()
     
-    cv2.imshow("Face Attendance", imgBackground)
-    
-    # Handle keyboard input
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
-        break
-    elif key == ord('s') and not lecture_active:
-        start_lecture()
-    elif key == ord('e') and lecture_active:
-        end_lecture()
-
-# Cleanup
-cap.release()
-cv2.destroyAllWindows()
-print("System shutdown complete")
-print ("Final attendance session data:")
-for id, info in attendance_session.items():
-    print(f"ID: {id}, Name: {info['name']}, Attendance: {info['total_attendance']}")
-    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    # Export attendance summary to CSV
+    if attendance_cooldown:
+        filename = f"attendance_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        try:
+            with open(filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Student ID', 'Name', 'Total Attendance', 'Last Marked Time'])
+                with cache_lock:
+                    for s_id, last_time in attendance_cooldown.items():
+                        info = student_cache.get(s_id, {}).get('info', {})
+                        writer.writerow([
+                            s_id, 
+                            info.get('name', 'N/A'), 
+                            info.get('total_attendance', 'N/A'),
+                            last_time.strftime('%Y-%m-%d %H:%M:%S')
+                        ])
+            print(f"Attendance summary exported to {filename}")
+        except Exception as e:
+            print(f"Error exporting CSV: {e}")
+            
+    print("Exiting...")
+
+if __name__ == "__main__":
+    main()
